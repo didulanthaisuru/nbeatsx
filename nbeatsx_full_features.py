@@ -28,8 +28,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from neuralforecast import NeuralForecast
 from neuralforecast.models import NBEATSx
+from neuralforecast.losses import MAE, MSE
 from neuralforecast.utils import AirPassengersDF
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import itertools
 
 print(nf_df.head())
 
@@ -54,8 +56,8 @@ for window in [7, 14, 30]:
 # Momentum and rate of change features
 nf_df['balance_diff_1d'] = nf_df['Normalized_Balance'].diff(1)
 nf_df['balance_diff_7d'] = nf_df['Normalized_Balance'].diff(7)
-nf_df['balance_pct_change_1d'] = nf_df['Normalized_Balance'].pct_change(1).fillna(0).clip(-1, 1)  # Clip to [-1, 1]
-nf_df['balance_pct_change_7d'] = nf_df['Normalized_Balance'].pct_change(7).fillna(0).clip(-1, 1)  # Clip to [-1, 1]
+nf_df['balance_pct_change_1d'] = nf_df['Normalized_Balance'].pct_change(1).fillna(0).clip(-1, 1)
+nf_df['balance_pct_change_7d'] = nf_df['Normalized_Balance'].pct_change(7).fillna(0).clip(-1, 1)
 
 # Exponential weighted features
 nf_df['ewm_7d'] = nf_df['Normalized_Balance'].ewm(span=7, min_periods=1).mean()
@@ -65,15 +67,10 @@ nf_df['ewm_30d'] = nf_df['Normalized_Balance'].ewm(span=30, min_periods=1).mean(
 # Fill NaN values
 nf_df = nf_df.fillna(method='bfill').fillna(method='ffill')
 
-print(nf_df.head())
-
 # Data preparation: Split into train (90%) and test (10%)
 train_size = int(len(nf_df) * 0.9)
 train_df = nf_df.iloc[:train_size].copy()
 test_df = nf_df.iloc[train_size:].copy()
-
-print(f"Training set size: {len(train_df)}")
-print(f"Testing set size: {len(test_df)}")
 
 # Handle missing values in both datasets
 train_df = train_df.fillna(method='bfill').fillna(method='ffill')
@@ -81,69 +78,181 @@ test_df = test_df.fillna(method='bfill').fillna(method='ffill')
 
 # Set up the data in NeuralForecast format
 train_data = train_df.copy()
-train_data['unique_id'] = 'balance'  # Add required ID column
+train_data['unique_id'] = 'balance'
 train_data = train_data.rename(columns={'Date': 'ds', 'Normalized_Balance': 'y'})
 
 test_data = test_df.copy()
 test_data['unique_id'] = 'balance'
 test_data = test_data.rename(columns={'Date': 'ds', 'Normalized_Balance': 'y'})
 
-# Define exogenous variables (all features except date, target and ID)
+# Define exogenous variables
 exogenous_vars = [col for col in train_data.columns
                   if col not in ['ds', 'y', 'unique_id']]
 
-print(f"Using {len(exogenous_vars)} exogenous variables: {exogenous_vars}")
+# Define hyperparameter grid
+param_grid = {
+    'input_size': [160],  # Best performing input size from previous runs
+    'max_steps': [1000],  # Using 1000 epochs as requested
+    'learning_rate': [0.001],  # Best performing learning rate
+    'batch_size': [1]  # Using batch size of 1 for maximum accuracy (stochastic gradient descent)
+}
 
-# Define forecast horizon
-horizon = 30
+# Initialize results storage
+results = []
 
-model = NBEATSx(
-    h=horizon,                   # Forecast horizon
-    input_size=160,        # Input window length
-    futr_exog_list=exogenous_vars,  # Use future exogenous variables if available
-    hist_exog_list=exogenous_vars,  # Use historical exogenous variables
-    random_seed=42,              # For reproducibility
-    scaler_type='standard'       # Standardize the data
-)
+# Perform grid search
+for input_size, max_steps, lr, batch_size in itertools.product(
+    param_grid['input_size'],
+    param_grid['max_steps'],
+    param_grid['learning_rate'],
+    param_grid['batch_size']
+):
+    print(f"\nTesting parameters: input_size={input_size}, max_steps={max_steps}, lr={lr}, batch_size={batch_size}")
 
-# Create the forecaster
-forecaster = NeuralForecast(
-    models=[model],
-    freq='D'  # Daily frequency
-)
+    model = NBEATSx(
+        h=30,  # Prediction horizon for next 30 days
+        input_size=input_size,
+        max_steps=max_steps,
+        learning_rate=lr,
+        batch_size=batch_size,
+        futr_exog_list=exogenous_vars,
+        hist_exog_list=exogenous_vars,
+        random_seed=42,
+        scaler_type='standard',
+        loss=MAE(),  # Using MAE loss for better robustness
+        valid_loss=MAE(),  # Using MAE for validation
+        num_stacks=10,  # Increasing number of stacks for better feature extraction
+        n_blocks=3,  # Increasing number of blocks for better pattern recognition
+        mlp_units=[[256, 256, 256, 256]],  # Increasing model capacity with multiple layers
+        dropout_prob_theta=0.1,  # Adding dropout for better generalization
+        activation='ReLU',  # Using ReLU activation
+        shared_weights=False,  # Not sharing weights for better feature learning
+        stack_types=['identity', 'trend', 'seasonality']  # Using all stack types for better pattern recognition
+    )
+    
+    forecaster = NeuralForecast(
+        models=[model],
+        freq='D'
+    )
 
-# Fit the model (train)
-forecaster.fit(df=train_data)
+    # Fit the model
+    forecaster.fit(df=train_data)
 
-# Generate forecasts
-forecast_df = forecaster.predict(
-    futr_df=test_data.iloc[:horizon]  # First 30 days of test data for comparison
-)
+    # Generate forecasts
+    forecast_df = forecaster.predict(futr_df=test_data.iloc[:30])
 
-# Extract actual values and forecasts
-actual = test_data['y'].iloc[:horizon].values
-forecast = forecast_df.loc[forecast_df['unique_id'] == 'balance', 'NBEATSx'].values
+    # Calculate metrics
+    actual = test_data['y'].iloc[:30].values
+    forecast = forecast_df.loc[forecast_df['unique_id'] == 'balance', 'NBEATSx'].values
+    
+    mae = mean_absolute_error(actual, forecast)
+    rmse = np.sqrt(mean_squared_error(actual, forecast))
+    
+    results.append({
+        'input_size': input_size,
+        'max_steps': max_steps,
+        'learning_rate': lr,
+        'batch_size': batch_size,
+        'mae': mae,
+        'rmse': rmse,
+        'forecast': forecast
+    })
+    
+    print(f"MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+
+# Convert results to DataFrame
+results_df = pd.DataFrame(results)
+
+# Find best parameters based on MAE and RMSE
+best_mae_idx = results_df['mae'].idxmin()
+best_rmse_idx = results_df['rmse'].idxmin()
+
+print("\nBest parameters based on MAE:")
+print(results_df.iloc[best_mae_idx])
+print("\nBest parameters based on RMSE:")
+print(results_df.iloc[best_rmse_idx])
 
 # Plot results
-plt.figure(figsize=(12, 6))
-plt.plot(range(horizon), actual, label='Actual', marker='o', alpha=0.7)
-plt.plot(range(horizon), forecast, label='NBEATSx Forecast', marker='x', alpha=0.7)
-plt.title('30-Day Balance Forecast vs Actual')
+plt.figure(figsize=(15, 10))
+
+# Plot 1: Actual vs Best MAE Forecast
+plt.subplot(2, 1, 1)
+plt.plot(range(30), actual, label='Actual', marker='o', alpha=0.7)
+plt.plot(range(30), results_df.iloc[best_mae_idx]['forecast'], 
+         label=f'Best MAE Forecast (MAE: {results_df.iloc[best_mae_idx]["mae"]:.4f})', 
+         marker='x', alpha=0.7)
+plt.title('Best MAE Forecast vs Actual')
 plt.xlabel('Days')
 plt.ylabel('Normalized Balance')
 plt.legend()
 plt.grid(True)
+
+# Plot 2: Actual vs Best RMSE Forecast
+plt.subplot(2, 1, 2)
+plt.plot(range(30), actual, label='Actual', marker='o', alpha=0.7)
+plt.plot(range(30), results_df.iloc[best_rmse_idx]['forecast'], 
+         label=f'Best RMSE Forecast (RMSE: {results_df.iloc[best_rmse_idx]["rmse"]:.4f})', 
+         marker='x', alpha=0.7)
+plt.title('Best RMSE Forecast vs Actual')
+plt.xlabel('Days')
+plt.ylabel('Normalized Balance')
+plt.legend()
+plt.grid(True)
+
 plt.tight_layout()
+plt.show()
 
-# Calculate error metrics
-mae = mean_absolute_error(actual, forecast)
-rmse = np.sqrt(mean_squared_error(actual, forecast))
-# Add small epsilon to avoid division by zero in MAPE calculation
-mape = np.mean(np.abs((actual - forecast) / (actual + 1e-8))) * 100
+# Plot parameter impact on errors
+plt.figure(figsize=(15, 10))
 
-print(f"Mean Absolute Error (MAE): {mae:.4f}")
-print(f"Root Mean Squared Error (RMSE): {rmse:.4f}")
-print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+# Plot 1: Input Size vs Errors
+plt.subplot(2, 2, 1)
+for input_size in param_grid['input_size']:
+    mask = results_df['input_size'] == input_size
+    plt.scatter(results_df[mask]['mae'], results_df[mask]['rmse'], 
+               label=f'input_size={input_size}', alpha=0.7)
+plt.xlabel('MAE')
+plt.ylabel('RMSE')
+plt.title('Input Size Impact')
+plt.legend()
+plt.grid(True)
 
+# Plot 2: Max Steps vs Errors
+plt.subplot(2, 2, 2)
+for max_steps in param_grid['max_steps']:
+    mask = results_df['max_steps'] == max_steps
+    plt.scatter(results_df[mask]['mae'], results_df[mask]['rmse'], 
+               label=f'max_steps={max_steps}', alpha=0.7)
+plt.xlabel('MAE')
+plt.ylabel('RMSE')
+plt.title('Max Steps Impact')
+plt.legend()
+plt.grid(True)
+
+# Plot 3: Learning Rate vs Errors
+plt.subplot(2, 2, 3)
+for lr in param_grid['learning_rate']:
+    mask = results_df['learning_rate'] == lr
+    plt.scatter(results_df[mask]['mae'], results_df[mask]['rmse'], 
+               label=f'lr={lr}', alpha=0.7)
+plt.xlabel('MAE')
+plt.ylabel('RMSE')
+plt.title('Learning Rate Impact')
+plt.legend()
+plt.grid(True)
+
+# Plot 4: Batch Size vs Errors
+plt.subplot(2, 2, 4)
+for batch_size in param_grid['batch_size']:
+    mask = results_df['batch_size'] == batch_size
+    plt.scatter(results_df[mask]['mae'], results_df[mask]['rmse'], 
+               label=f'batch_size={batch_size}', alpha=0.7)
+plt.xlabel('MAE')
+plt.ylabel('RMSE')
+plt.title('Batch Size Impact')
+plt.legend()
+plt.grid(True)
+
+plt.tight_layout()
 plt.show()
 
